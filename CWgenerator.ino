@@ -3,7 +3,7 @@
 
 // pin functions:
 // 0 OC0A standby led
-// 1 OC0B active led
+// 1 PORTB1 soft start bypass mosfet output
 // 2 INT0 charge button
 // 3 PORTB3 charge mosfet output
 // 4 ADC2 output voltage in
@@ -14,13 +14,16 @@ enum LedMode : uint8_t {
   ON, // duh
   BLINK, // 2Hz full blinks
   BREATHE, // 2Hz, increasing then decreasing duty cycle
-  BLINK_FAST // 8Hz full blinks
+  BREATHE_FAST, // 4Hz breathe
+  BLINK_FAST, // 4Hz full blinks
+  BLINK_VERY_FAST, // 8Hz full blinks
+  BLINK_EXTREMELY_FAST // 16Hz full blinks
 };
 
 enum Mode : uint8_t {
   IDLE, // low voltage, not active
   CHARGED, // high voltage, not active
-  TRICKLE_CHARGING, // low voltage, active
+  SOFT_START_CHARGING, // low voltage, active
   CHARGING, // high voltage, active
   CHARGED_MAINTAIN, // high voltage, not active
   CHARGING_MAINTAIN, // high voltage, active
@@ -34,7 +37,7 @@ void setup() {
   PORTB = 0b00000100; // pullup 2
 
   TCCR0A = (1 << WGM01) | (1 << WGM00); // Fast PWM
-  TCCR0A |= (1 << COM0A1) | (1 << COM0B1); // non inverting output on OC0A (pin 0), OC0B (pin 1)  
+  TCCR0A |= (1 << COM0A1); // non inverting output on OC0A (pin 0)
   TCCR0B = (1 << CS01); //set prescaler to /8
 
   TCCR1 = (1 << CS13) | (1 << CS12) | (1 << CS11) | (1 << CS10); // set prescaler to /16384
@@ -49,9 +52,8 @@ void setup() {
   sei();
 }
 
-void maintainLedOutputs(LedMode standbyLedMode, LedMode activeLedMode){
+void maintainLedOutputs(LedMode standbyLedMode){
   static uint8_t standbyLedOutput; // OCR0A
-  static uint8_t activeLedOutput; // OCR0B
   switch(standbyLedMode){
     case OFF:
       OCR0A = 0;
@@ -63,43 +65,34 @@ void maintainLedOutputs(LedMode standbyLedMode, LedMode activeLedMode){
       OCR0A = (TCNT1 & 0x80)? 0xFF : 0;
       break;
     case BLINK_FAST:
+      OCR0A = (TCNT1 & 0x40)? 0xFF : 0;
+      break;
+    case BLINK_VERY_FAST:
       OCR0A = (TCNT1 & 0x20)? 0xFF : 0;
+      break;
+    case BLINK_EXTREMELY_FAST:
+      OCR0A = (TCNT1 & 0x10)? 0xFF : 0;
       break;
     case BREATHE:
       OCR0A = (TCNT1 & 0x80)
         ? map(TCNT1, 0x80, 0xFF, 0xFF, 0)
         : map(TCNT1, 0, 0x7F, 0, 0xFF);
       break;
-  }  
-  switch(activeLedMode){
-    case OFF:
-      OCR0B = 0;
-      break;
-    case ON:
-      OCR0B = 0xFF;
-      break;
-    case BLINK:
-      OCR0B = (TCNT1 & 0x80)? 0xFF : 0;
-      break;
-    case BLINK_FAST:
-      OCR0B = (TCNT1 & 0x20)? 0xFF : 0;
-      break;
-    case BREATHE:
-      OCR0B = (TCNT1 & 0x80)
-        ? map(TCNT1, 0x80, 0xFF, 0xFF, 0)
-        : map(TCNT1, 0, 0x7F, 0, 0xFF);
+    case BREATHE_FAST:
+      OCR0A = (TCNT1 & 0x40)
+        ? map(2*TCNT1, 0x80, 0xFF, 0xFF, 0)
+        : map(2*TCNT1, 0, 0x7F, 0, 0xFF);
       break;
   }
-  
   return;
 }
  
-uint8_t MAINTAIN_VOLTAGE_DELTA_2V = 15;
+uint8_t MAINTAIN_VOLTAGE_DELTA_2V = 8;
 uint8_t SAFE_VOLTAGE_2V = 15;
-uint8_t MAXIMUM_TRICKLE_CHARGING_VOLTAGE_2V = 25; // over 50V, current consumption on continuous charging will be low enough
+uint8_t MINUMUM_SOFT_START_BYPASS_VOLTAGE_2V = 45; // over 90V, current consumption on continuous charging will be low enough
 uint8_t MINIMUM_SET_VOLTAGE_2V = 80; // at least 160V
-uint8_t MAXIMUM_SET_VOLTAGE_2V = 215; // at most 430V
-uint8_t MAXIMUM_OPERATING_VOLTAGE_2V = 218; // ~440V - stop immediately!
+uint8_t MAXIMUM_SET_VOLTAGE_2V = 210; // at most 420V
+uint8_t MAXIMUM_OPERATING_VOLTAGE_2V = 218; // ~435V - stop immediately!
 
 // in units of 2V (since expect an absolute maximum of 450V)
 uint8_t readSetVoltage(){
@@ -118,9 +111,10 @@ uint8_t readOutputVoltage(){
   ADCSRA |= (1 << ADSC); // start ADC
   while (ADCSRA & (1 << ADSC));
   // the output voltage is fed through a 1/101 divider. Vref is 5.1V. 
-  // So maximum reading indicates 5.1*101, or an output value of 258 in units of 2V (and an imminent explosion since this is well over 500V)
-  // therefore the output should saturate at around 252 = 0xFC
-  return map(ADCH, 0, 0xFC, 0, 0xFF);
+  // this will require calibration with an external voltage reference to be sure, though, since the ADC just isn't that accurate.
+  return map(ADCH, 0, 0xFF, 0, 0xFC);
+  // on my particular ATTINY, setting the input and output ranges as such gives the correct voltage as output in units of 2V. 
+  // note that the maximum output represents a voltage well in excess of 500V, and therefore also an imminent explosion.
 }
 
 volatile uint8_t buttonEventToConsume;
@@ -141,33 +135,40 @@ void charge(uint8_t active){
   }
 }
 
+void bypassSoftStart(uint8_t bypass){
+    if (bypass){
+    PORTB |= (1 << PORTB1);
+  } else {
+    PORTB &= ~(1 << PORTB1);
+  }
+}
+
 void loop() {
   static Mode mode = (readOutputVoltage() >= MINIMUM_SET_VOLTAGE_2V)? CHARGED : IDLE;
   switch (mode){
     case IDLE:
-      maintainLedOutputs(ON, OFF);
+      maintainLedOutputs(ON);
+      bypassSoftStart(0);
       if (chargeButtonIsPressed()){
-        if (readOutputVoltage() >= MAXIMUM_TRICKLE_CHARGING_VOLTAGE_2V){
+        if (readOutputVoltage() >= MINUMUM_SOFT_START_BYPASS_VOLTAGE_2V){
           mode = CHARGING;
         } else {
-          mode = TRICKLE_CHARGING;
+          mode = SOFT_START_CHARGING;
         }
       }
       break;
-    case TRICKLE_CHARGING:
-      // capacitors at 0V will suck a TON of current, easily knocking out a ZVS driver. So pulse-charge them. Don't worry about the relay, it is mains rated
-      maintainLedOutputs(ON, BLINK_FAST);
-      charge(
-        !(TCNT1 & 0x02) // pulse the relay at (128Hz at 50% duty) 
-        && !(TCNT1 & 0x60) // as a AM carrier for 4Hz 25% duty, so 8 pulses on, then 24 "silent" pulses, then ...
-        // in effect this is !(TCNT & 0x62)
-        ); 
-      if (readOutputVoltage() >= MAXIMUM_TRICKLE_CHARGING_VOLTAGE_2V){
+    case SOFT_START_CHARGING:
+      // capacitors at 0V will suck a TON of current, easily knocking out a ZVS driver. So direct voltage through the soft start resistors first
+      maintainLedOutputs(BLINK);
+      bypassSoftStart(0);
+      charge(1); 
+      if (readOutputVoltage() >= MINUMUM_SOFT_START_BYPASS_VOLTAGE_2V){
         mode = CHARGING;
       }
       break;
     case CHARGING:
-      maintainLedOutputs(ON, BLINK);
+      maintainLedOutputs(BLINK_FAST);
+      bypassSoftStart(1);
       charge(1);
       // finished charging?
       if (readOutputVoltage() >= readSetVoltage()){
@@ -179,7 +180,7 @@ void loop() {
       }
       break;
     case CHARGED:
-      maintainLedOutputs(ON, ON);
+      maintainLedOutputs(ON);
       charge(0);
       if (chargeButtonIsPressed()){
         mode = CHARGED_MAINTAIN;
@@ -190,7 +191,7 @@ void loop() {
       }
       break;
     case CHARGED_MAINTAIN:
-      maintainLedOutputs(BREATHE, ON);
+      maintainLedOutputs(BREATHE);
       charge(0);
       if (chargeButtonIsPressed()){
         mode = CHARGED;
@@ -205,7 +206,7 @@ void loop() {
       }
       break;
     case CHARGING_MAINTAIN:
-      maintainLedOutputs(BREATHE, BLINK);
+      maintainLedOutputs(BREATHE_FAST);
       charge(1);
       if (chargeButtonIsPressed()){
         mode = CHARGING;
@@ -223,7 +224,8 @@ void loop() {
     case ERROR:
       // terminal state - deactivate charging!
       charge(0);
-      maintainLedOutputs(BLINK_FAST, BLINK_FAST);
+      bypassSoftStart(0);
+      maintainLedOutputs(BLINK_EXTREMELY_FAST);
       break;
   }
   // check output voltage is within maximum
